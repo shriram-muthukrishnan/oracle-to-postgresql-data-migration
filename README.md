@@ -142,7 +142,7 @@ $tgtServerResourceId = "/subscriptions/$sub/resourceGroups/$rg/providers/Microso
 $migId       = [guid]::NewGuid().ToString()
 $schemaMigId = $migId
 $dbMigId     = $migId
-```powershell
+```
 
 ```powershell
 $secure  = (Get-AzAccessToken -ResourceUrl "https://management.azure.com" -AsSecureString).Token
@@ -153,7 +153,7 @@ $headers = @{ Authorization = "Bearer $token" }
 ### Helpers, paths and request bodies (run once)
 Run this whole block before issuing any request. 
 
-```
+```powershell
 # ---------- Helper: poll a long-running operation to completion ----------
 # The async actions (testConnectivity / discoverDatabaseObjects) and the migration
 # PUT are long-running. Send them with Invoke-WebRequest so the async status URL in
@@ -278,7 +278,7 @@ The migration runs in the background. Run the command below at any time to check
 ```powershell
 Invoke-RestMethod -Method GET -Uri $migPath -Headers $headers `
     -ContentType "application/json" | ConvertTo-Json -Depth 20
-```powershell
+```
 
 Look at the migration’s status in the response to understand where it is: 
 
@@ -299,7 +299,7 @@ $cancelBody = @{
 } | ConvertTo-Json -Depth 10
 ```
 
-```
+```powershell
 Invoke-RestMethod -Method PATCH -Uri $migPath -Headers $headers -ContentType "application/json" -Body $cancelBody
 ```
 
