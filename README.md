@@ -101,7 +101,11 @@ DMS must be able to connect to both the Oracle source database and the Azure Dat
 
 - Source and target database hostnames must be resolvable from DMS. 
 
-- Ensure that the public IP range **20.240.138.64/30** is whitelisted in firewalls and network security rules to enable migration connectivity. 
+- **Public connectivity:** Ensure that the public IP range **20.240.138.64/30** is whitelisted in firewalls and network security rules to enable migration connectivity.
+
+- **Private connectivity (API `2026-11-01-preview`):** DMS provisions its own migration VNet and peers it with your customer VNet. The customer VNet must have a route to both databases, with non-overlapping address spaces and firewall/NSG rules allowing the database ports. For an on-premises Oracle source, ensure the VPN/ExpressRoute routing and gateway configuration also allow traffic from the peered migration VNet; peering is not transitive.
+
+- For private connectivity, provide the customer VNet resource ID and any private DNS zone resource IDs needed to resolve the database hostnames from the migration VNet. Use the actual zone associated with your PostgreSQL server, not a guessed zone name. The caller must have permission to peer the customer VNet, and provisioning must have permission to create the required peering and private DNS VNet links. Confirm the required access with your preview onboarding contact before registering.
 
 ## Tutorial: Your first migration
 ### Set your parameters
@@ -113,8 +117,19 @@ $base = "https://management.azure.com"
 $sub  = "<subscription_id>"
 $rg   = "<resource_group>"
 $svc  = "<name_for_your_database_migration_service>"
-$api  = "2025-01-10-preview" # API version
+$api  = "2026-11-01-preview" # API version
 $loc  = "swedencentral"      # Service location
+# --- Connectivity ---
+$connectivityMode = "Public" # Set to "Private" to provision VNet peering.
+# Used only for Private connectivity. Add a second entry if the databases use different VNets.
+$customerPeerings = @(
+    @{
+        vnetResourceId = "/subscriptions/<network_subscription_id>/resourceGroups/<network_rg>/providers/Microsoft.Network/virtualNetworks/<customer_vnet>"
+        privateDnsZoneResourceIds = @(
+            "/subscriptions/<dns_subscription_id>/resourceGroups/<dns_rg>/providers/Microsoft.Network/privateDnsZones/<database_private_dns_zone>"
+        )
+    }
+)
 # --- Oracle source ---
 $srcConnName   = "OracleSource" # Logical connection name. Keep it as-is.
 $srcHost       = "<host_ip_oracle_server>"
@@ -140,8 +155,6 @@ $tgtServerResourceId = "/subscriptions/$sub/resourceGroups/$rg/providers/Microso
 ```powershell
 # A new id is generated for the migration PUT;
 $migId       = [guid]::NewGuid().ToString()
-$schemaMigId = $migId
-$dbMigId     = $migId
 ```
 
 ```powershell
@@ -154,52 +167,72 @@ $headers = @{ Authorization = "Bearer $token" }
 Run this whole block before issuing any request. 
 
 ```powershell
-# ---------- Helper: poll a long-running operation to completion ----------
-# The async actions (testConnectivity / discoverDatabaseObjects) and the migration
-# PUT are long-running. Send them with Invoke-WebRequest so the async status URL in
-# the response headers is readable, then hand the response here to poll
-# Azure-AsyncOperation / Location until the operation reaches a terminal state.
-function Wait-AsyncOperation {
-    param([object]$Response, [hashtable]$Headers)
+# ---------- Helper: wait for registered migration compute ----------
+function Wait-MigrationCompute {
+    param([string]$Uri, [hashtable]$Headers, [int]$TimeoutMinutes = 30)
 
-    Write-Host "Initial status code: $($Response.StatusCode)"
-# Header values can come back as String[]; force a single string.
-$statusUrl = @($Response.Headers["Azure-AsyncOperation"])[0]
-    if (-not $statusUrl) { $statusUrl = @($Response.Headers["Location"])[0] }
-# Not a long-running op - just return the body.
-    if (-not $statusUrl) { return ($Response.Content | ConvertFrom-Json) }
-    Write-Host "Polling: $statusUrl"
-    do {
-        Start-Sleep -Seconds 5
-        $status = Invoke-RestMethod -Method GET -Uri $statusUrl -Headers $Headers -ContentType "application/json"
-        Write-Host "  status = $($status.status)"
-    } while ($status.status -in @("Accepted","Running","InProgress","NotStarted","Pending"))
-    return $status
+    $deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMinutes)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $migration = Invoke-RestMethod -Method GET -Uri $Uri -Headers $Headers `
+            -ContentType "application/json" -ErrorAction Stop
+        $properties = $migration.properties
+        $computeState = $properties.computeProvisioningState
+        $operationStatus = $properties.activeOperation.status
+        Write-Host "Compute provisioning state: $computeState"
+        if ($computeState -in @("Failed", "Deprovisioning", "Deprovisioned") -or
+            $properties.provisioningState -in @("Failed", "Canceled") -or
+            $operationStatus -in @("Failed", "Canceled")) {
+            throw "Migration provisioning failed. Inspect the migration response: $($migration | ConvertTo-Json -Depth 20 -Compress)"
+        }
+        if ($computeState -eq "Provisioned" -and
+            $operationStatus -notin @("Accepted", "Running", "InProgress", "NotStarted", "Pending")) {
+            return $migration
+        }
+        Start-Sleep -Seconds 15
+    }
+    throw "Timed out waiting for migration compute after $TimeoutMinutes minutes. Inspect the migration before starting it."
 }
 # ---------- Paths (built from the params above - no manual URL typing) ----------
 $svcRoot               = "$base/subscriptions/$sub/resourceGroups/$rg/providers/Microsoft.DataMigration/databaseMigrationServices/$svc"
 $createServicePath     = "$($svcRoot)?api-version=$api"
 $deleteServicePath     = "$($svcRoot)?api-version=$api"
-$checkConnectivityPath = "$($svcRoot)/testConnectivity?api-version=$api"
-$discoverObjectsPath   = "$($svcRoot)/discoverDatabaseObjects?api-version=$api"
-$migPath               = "$($svcRoot)/migrations/$($migId)?api-version=$api"
-$schemaPath            = "$($svcRoot)/migrations/$($schemaMigId)/schemaStatuses?api-version=$api"
-$dbPath                = "$($svcRoot)/migrations/$($dbMigId)/databaseStatuses?api-version=$api"
+$migRoot               = "$($svcRoot)/migrations/$migId"
+$migPath               = "$($migRoot)?api-version=$api"
+$startPath             = "$($migRoot)/start?api-version=$api"
 # ---------- Bodies ----------
 $serviceBody = @{
     location   = $loc
     tags       = @{ environment = "test" }
     properties = @{}
 } | ConvertTo-Json -Depth 10
-$migBody = @{
-    properties = @{
-        migrationName        = "Oracle to PostgreSQL Migration"
-        description          = "Migrating from Oracle to Azure Database for PostgreSQL Flexible Server"
+$registerProperties = @{
+    migrationName = "Oracle to PostgreSQL Migration"
+    description   = "Migrating from Oracle to Azure Database for PostgreSQL Flexible Server"
+    sourceType    = "Oracle"
+    targetType    = "Azure Database for PostgreSQL"
+}
+switch ($connectivityMode) {
+    "Public" {
+        $registerProperties.networkConfiguration = @{ connectivityMode = "Public" }
+    }
+    "Private" {
+        $registerProperties.networkConfiguration = @{
+            connectivityMode = "Private"
+            topology         = "VnetPeering"
+            vnetPeering      = @{ peerings = $customerPeerings }
+        }
+    }
+    default { throw "connectivityMode must be Public or Private." }
+}
+$registerBody = @{
+    properties = $registerProperties
+} | ConvertTo-Json -Depth 20
+
+$startBody = @{
         migrationMode        = "offline"
-        sourceServerType     = "On-Premises"
-        targetServerType     = "AzurePostgreSQLFlexibleServer"
         source               = @{
             sourceType          = "Oracle"
+            sourceServerType    = "On-Premises"
             serverResourceId    = ""
             connectionEndPoints = @(
                 @{
@@ -215,6 +248,7 @@ $migBody = @{
         }
         target               = @{
             targetType          = "Azure Database for PostgreSQL"
+            targetServerType    = "AzurePostgreSQLFlexibleServer"
             serverResourceId    = $tgtServerResourceId
             connectionEndPoints = @(
                 @{
@@ -239,7 +273,6 @@ $migBody = @{
             }
         )
         migrationJobSettings = @()
-    }
 } | ConvertTo-Json -Depth 20
 ```
 
@@ -258,18 +291,28 @@ Invoke-RestMethod -Method GET -Uri $createServicePath -Headers $headers `
     -ContentType "application/json" | ConvertTo-Json -Depth 10
 ```
 
-### Start your migration
-With the migration service provisioned, you’re ready to start migration itself. Use the freshly generated `$migId` to start a migration. 
+### Register and provision the migration
+With the migration service provisioned, register the migration using the freshly generated `$migId`. In API `2026-11-01-preview`, this PUT provisions dedicated migration compute but **does not start copying data**.
+
+For private connectivity, set `$connectivityMode = "Private"` and replace the VNet and DNS zone placeholders in the parameter block **before running the helpers and bodies block**. Registration provisions the migration VNet, its peering connections, and the requested private DNS links. Up to two distinct customer VNets and up to five private DNS zones per peering are supported. Set `privateDnsZoneResourceIds = @()` only if no private DNS zone links are needed. The `PrivateEndpoint` topology is not supported in this API version.
 
 ```powershell
-try {
-    $migResp = Invoke-WebRequest -Method PUT -Uri $migPath -UseBasicParsing `
-        -Headers $headers -ContentType "application/json" -Body $migBody
-    Wait-AsyncOperation -Response $migResp -Headers $headers | ConvertTo-Json -Depth 20
-} catch {
-    Write-Warning "Start migration failed: $($_.Exception.Message)"
-    if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message }
-}
+Invoke-RestMethod -Method PUT -Uri $migPath -Headers $headers `
+    -ContentType "application/json" -Body $registerBody -ErrorAction Stop |
+    ConvertTo-Json -Depth 20
+
+Wait-MigrationCompute -Uri $migPath -Headers $headers | ConvertTo-Json -Depth 20
+```
+
+Do not continue until `properties.computeProvisioningState` is **Provisioned**. If provisioning fails or times out, inspect the migration response and resolve the networking or permission error before proceeding. Re-running the wait helper does not start a migration.
+
+### Start your migration
+After registration and compute provisioning complete, submit the source, target, and mappings to the migration-scoped `/start` action. Its body is **not** wrapped in `properties`. This starts the offline copy using the existing `$migId`; do not generate a new ID between registration and start.
+
+```powershell
+Invoke-RestMethod -Method POST -Uri $startPath -Headers $headers `
+    -ContentType "application/json" -Body $startBody -ErrorAction Stop |
+    ConvertTo-Json -Depth 20
 ```
 
 ### Check the migration status
@@ -288,14 +331,14 @@ Look at the migration’s status in the response to understand where it is:
 
 - **Failed** — the migration didn’t complete. Review the error details in the response. We’ll debug the failure with you and provide an RCA. 
 
-- **Canceled** — the migration was stopped (see Step 6). 
+- **Canceled** — the migration was stopped (see "Cancel an ongoing migration").
 
 ### Cancel an ongoing migration
 If you need to stop a migration that’s in progress — for example, you started it with the wrong parameters or need to reschedule your maintenance window — cancel it with the PATCH command below. 
 
 ```powershell
 $cancelBody = @{
-    properties = @{ migrationOperationType = "Cancel" }
+    properties = @{ operationType = "cancel" }
 } | ConvertTo-Json -Depth 10
 ```
 
@@ -303,7 +346,7 @@ $cancelBody = @{
 Invoke-RestMethod -Method PATCH -Uri $migPath -Headers $headers -ContentType "application/json" -Body $cancelBody
 ```
 
-This submits a cancel request for the migration identified by `$migId` . Confirm it was canceled by running the status check from Step 6 and looking for a **Canceled** state. 
+This submits a cancel request for the migration identified by `$migId`. Confirm it was canceled by running the migration status check above and looking for a **Canceled** state. Cancellation applies only after the migration has started; to remove a registered migration that has not started, send a DELETE to `$migPath` instead.
 
 ## FAQ
 ### Does the service migrate both schema and data, or just data?
@@ -349,7 +392,7 @@ Data validation is not currently part of the migration service. In the meantime,
 ## Limitations and known issues
 1. **Offline migration only** - The service currently supports offline migration only. Your application must be stopped or set to read-only during the migration. Support for online (near-zero-downtime) migration will be introduced in a later phase. 
 
-2. **Public connectivity only -** Azure DMS connects to the source and target databases over public IPs. Connectivity over private IPs (private endpoints / private tunneling) is not supported today and will be introduced in the next phase. 
+2. **Private connectivity requires VNet peering -** API `2026-11-01-preview` supports public connectivity or private connectivity through customer VNet peering and private DNS links configured at migration registration. The `PrivateEndpoint` topology is not supported. Private access to an on-premises source additionally requires working VPN/ExpressRoute routing from the migration VNet.
 
 3. **Username/password authentication only** - Migration users must authenticate using username and password for both Oracle and Azure Database for PostgreSQL. Support for wallet-based authentication and managed identity authentication will be added later. 
 
@@ -383,5 +426,4 @@ To help us assist you faster, please have the following ready when you reach out
 - Source Oracle and target PostgreSQL versions 
 
 - The error message or a screenshot 
-
 
