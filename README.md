@@ -138,6 +138,7 @@ $srcDb         = "<service_name>"
 $srcUser       = "<schema_name>"
 $srcPass       = "<password_for_schema>"
 $srcSchema     = "<schema_name>"
+$srcSslMode    = "disable" # Source only; disable uses unencrypted TCP.
 # --- Azure Database for PostgreSQL Flexible Server (target) ---
 $tgtServer     = "<name_of_postgresql_server>" # Flexible Server resource name
 $tgtConnName   = "PostgreSqlTarget"             # Logical connection name. Keep it as-is.
@@ -242,7 +243,7 @@ $startBody = @{
                     serviceName    = $srcDb
                     databaseName   = $srcDb
                     credentials    = @{ authenticationMethod = "password"; userName = $srcUser; password = $srcPass }
-                    ssl            = @{ mode = "prefer" }
+                    ssl            = @{ mode = $srcSslMode }
                 }
             )
         }
@@ -381,7 +382,7 @@ Yes. You can select multiple schemas, but each migration writes to a **single Po
 Refer to the Required Permissions section. 
 
 ### Is my data encrypted in transit and rest during the migration?
-Yes. Data is fully encrypted both in transit and at rest throughout the migration. 
+Data is encrypted at rest. The PostgreSQL target connection uses TLS (`require`). Oracle source encryption depends on `$srcSslMode`: the default `disable` uses unencrypted TCP. For Oracle TCPS, set it to `verify_full`, use the TCPS listener port, and ensure the source hostname matches a certificate trusted by the migration VM.
 
 ### Does my data stay within my chosen Azure region?
 DMS sits between the source and target servers. As a best practice, provision your target PostgreSQL server and DMS as close to the source as possible. If DMS is in the same region as the source and target, data does not cross Azure regions. If DMS is in a different region, data travels across regions along the path Source -> DMS -> Target. 
@@ -426,4 +427,3 @@ To help us assist you faster, please have the following ready when you reach out
 - Source Oracle and target PostgreSQL versions 
 
 - The error message or a screenshot 
-
